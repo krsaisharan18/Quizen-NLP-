@@ -102,6 +102,9 @@
   .fb{margin-top:12px;padding:12px 14px;border-radius:12px;font-size:.93rem}
   .fb.ok{background:var(--ok-bg);color:var(--ok)} .fb.no{background:var(--bad-bg);color:var(--bad)}
   .fb .src{display:block;margin-top:6px;color:var(--mute);font-style:italic}
+  .concepts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px}
+  .concepts small{color:var(--mute);font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:.7rem;margin-right:4px}
+  .concepts span.c{background:var(--brand-soft);color:var(--brand);font-weight:600;font-size:.82rem;padding:3px 10px;border-radius:99px}
   .hidden{display:none!important}
 
   .result{text-align:center;padding:28px 22px}
@@ -175,6 +178,7 @@
       <div class="row"><span id="answered">0 of 0 answered</span><span id="info"></span></div>
       <div class="prog"><i id="bar"></i></div>
     </div>
+    <div class="concepts hidden" id="concepts"></div>
     <div id="qs"></div>
 
     <div class="card result hidden" id="result">
@@ -201,7 +205,7 @@
 const $ = s => document.querySelector(s);
 const SAMPLE = `The history of computing stretches back long before the electronic computer. Charles Babbage designed the Analytical Engine in 1837, a mechanical machine that is widely regarded as the first design for a general-purpose computer. Ada Lovelace wrote the first algorithm intended for the Analytical Engine, and she is often called the first computer programmer. In 1936, Alan Turing introduced the Turing machine, an abstract model of computation that defines what an algorithm can compute. The Turing machine remains the foundation of theoretical computer science. The ENIAC was completed in 1945 at the University of Pennsylvania. It used about 18,000 vacuum tubes and weighed roughly 30 tons. Vacuum tubes were later replaced by transistors, which are smaller, faster and far more reliable. The transistor was invented at Bell Laboratories in 1947 by John Bardeen, Walter Brattain and William Shockley. Jack Kilby demonstrated the first integrated circuit in 1958. Gordon Moore observed that the number of transistors on a chip doubles roughly every two years, an observation known as Moore's Law. The World Wide Web was proposed by Tim Berners-Lee at CERN in 1989. Machine learning is a branch of artificial intelligence that allows computers to learn patterns from data.`;
 const L='ABCD', LABEL={mcq:'Multiple choice',tf:'True / False',wh:'Short answer',cloze:'Fill in the blank'};
-let mode='paste', quiz=[], seedBump=0, locked=false, srcName='';
+let mode='paste', quiz=[], concepts=[], seedBump=0, locked=false, srcName='';
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const bytes = b => b > 1048576 ? (b/1048576).toFixed(1)+' MB' : Math.max(1,Math.round(b/1024))+' KB';
@@ -251,7 +255,7 @@ async function generate(){
   try{
     const r=await fetch('/api/generate',{method:'POST',body:fd}); const j=await r.json();
     if(!r.ok) throw new Error(j.error||'Something went wrong.');
-    quiz=j.questions; $('#info').textContent=`${quiz.length} questions · ${j.sentences} sentences read`;
+    quiz=j.questions; concepts=j.concepts||[]; $('#info').textContent=`${quiz.length} questions · ${j.sentences} sentences read`;
     render(); $('#quiz').classList.remove('hidden');
     $('#quiz').scrollIntoView({behavior:'smooth',block:'start'});
   }catch(e){ showErr(e.message); }
@@ -264,6 +268,9 @@ $('#regen').onclick=regen; $('#regen2').onclick=regen;
 /* ---------- render ---------- */
 function stem(t){ return esc(t).replace(/_{5,}/g,'<span class="blank"></span>'); }
 function render(){
+  const cc=$('#concepts');
+  cc.innerHTML=concepts.length?'<small>Key concepts</small>'+concepts.map(c=>`<span class="c">${esc(c)}</span>`).join(''):'';
+  cc.classList.toggle('hidden',!concepts.length);
   locked=false; $('#result').classList.add('hidden'); $('#qactions').classList.remove('hidden');
   $('#qs').innerHTML=quiz.map((q,i)=>{
     let body='';
@@ -291,7 +298,7 @@ function grade(i,reveal){
   } else if(q.qtype==='tf'){
     const s=card.querySelector('input:checked'); given=s?s.value:null; ok=given===q.answer;
     card.querySelectorAll('.opt').forEach(l=>{const v=l.dataset.v; l.classList.toggle('right',v===q.answer); l.classList.toggle('wrong',v===given&&!ok);});
-  } else { given=card.querySelector('input.txt').value.trim(); ok=similar(given,q.answer); }
+  } else { given=card.querySelector('input.txt').value.trim(); ok=(q.accept&&q.accept.length?q.accept:[q.answer]).some(a=>similar(given,a)); }
   const skipped=given===null||given==='';
   const ans=q.qtype==='mcq'?`${q.answer_letter}) ${q.answer}`:q.answer;
   fb.className='fb '+(ok?'ok':'no');

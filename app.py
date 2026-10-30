@@ -81,7 +81,7 @@ def generate():
         qs = gen.generate(n, types)
         if not qs:
             return jsonify(error="Couldn't build questions from this text. Try longer, factual prose."), 422
-        return jsonify(questions=[q.to_dict() for q in qs], sentences=len(gen.sentences))
+        return jsonify(questions=[q.to_dict() for q in qs], sentences=len(gen.sentences), concepts=gen.key_concepts)
     except ValueError as e:
         return jsonify(error=str(e)), 400
     except zipfile.BadZipFile:

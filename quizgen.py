@@ -4,40 +4,45 @@ Automatic Quiz Generation from Text -- classical NLP only (no LLMs, no neural te
 
 Pipeline
 --------
-1. Preprocessing      : whitespace normalisation, rule-based sentence segmentation
-                        (abbreviation / initial aware), regex word tokenisation.
-2. Linguistic cues    : heuristic POS filtering (stop-words, verb/adverb suffix rules),
-                        capitalisation-based proper-noun chunking (light NER), regex
-                        YEAR / NUMBER detection.
-3. Importance scoring : TF-IDF over sentences, TextRank (graph centrality on cosine
-                        similarity) for sentence selection, TF-IDF weights for keywords.
-4. Distractors        : LSA (TruncatedSVD on TF-IDF) context vectors -> semantically
-                        close but distinct terms from the same text; numeric
-                        perturbation for years / quantities.
-5. Question building  : cloze, multiple-choice, True/False, and rule-based WH
-                        questions (subject-aux inversion templates).
+1. Linguistic analysis (nlp.py)
+     tokenise -> POS-tag -> chunk noun phrases -> parse each clause into
+     lead adverbial / subject / verb group / voice / objects / PPs / appositive
+     -> type entities (PERSON, ORG, PLACE, NAMED, YEAR, QUANTITY, CONCEPT)
+     -> resolve pronouns ("It" -> "The ENIAC") and bare surnames ("Turing" -> "Alan Turing").
+2. Meaning-driven question frames
+     "A <invented> B in <YEAR>"          -> Who / When / Where questions
+     "X was <verb-ed> by Y"              -> Who ... ?  /  What replaced ... ?
+     "X used <N> things"                 -> How many ... ?  /  How much ... ?
+     "X is a Y that ..."                 -> definition question (which term?)
+     "..., an observation known as Z"    -> What is the observation ... known as?
+     any sentence                        -> True/False (role-aware false swaps) and cloze
+3. Importance ranking
+     TF-IDF + TextRank sentence centrality; keyphrase recurrence.
+4. Distractors
+     same entity type (person / place / term / year / number), LSA-similar context,
+     never present in the source sentence, no shared words between options.
+5. Selection
+     score x diversity (type mix, one question per answer, spread over the text).
 
-Dependencies: numpy, scikit-learn (nothing else).
+Dependencies: numpy, scikit-learn.
 """
 from __future__ import annotations
 
 import argparse
 import difflib
-import itertools
 import json
 import random
 import re
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 import numpy as np
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-# --------------------------------------------------------------------------- #
-# Lexical resources
-# --------------------------------------------------------------------------- #
+from nlp import ANAPHORIC, Analyzer, MEASURE_VERBS, ORG_WORDS, PLACE_WORDS, UNITS, past_tense, third_person
+
 STOP = set("""a about above after again against all almost also although always am among an and
 another any are around as at be because been before being below between both but by can could did
 do does doing down during each either else even ever every few for from further had has have having
@@ -48,124 +53,48 @@ the their theirs them themselves then there these they this those through thus t
 upon us very was we were what when where whether which while who whom whose why will with within
 without would yet you your yours yourself yourselves""".split())
 
-# Frequent verbs / light words that should not form part of a noun-phrase term.
-VERBISH = set("""use uses used make makes made produce produces convert converts contain contains
-include includes become becomes called known help helps allow allows create creates take takes give
-gives show shows cause causes form forms provide provides require requires need needs begin begins
-began get gets got go goes went see sees saw find finds found keep keeps held hold holds run runs ran
-work works build builds built lead leads led move moves play plays turn turns bring brings""".split())
-
-MONTHS_DAYS = set("""january february march april june july august september october november december
-monday tuesday wednesday thursday friday saturday sunday""".split())
-
-CONNECT = {"of", "the", "de", "von", "van", "for"}
-UNITS = {"percent", "million", "billion", "trillion", "thousand", "hundred"}
-BAD_STARTS = {"he", "she", "it", "they", "this", "these", "those", "that", "however", "moreover",
-              "also", "but", "and", "thus", "therefore", "such", "their", "his", "her", "its",
-              "furthermore", "meanwhile", "then", "so", "yet", "instead", "nevertheless"}
-
-# Adjectives / ordinals / determiner-like words that should not start a noun-phrase term.
-GENERIC = set("""first second third last next previous new old many several various large small big little
-great modern early late single different general same main major certain complete abstract powerful further
-other another own whole entire real common recent current future possible important similar particular
-specific total half full high low long short best better most least basic key""".split())
-GENERIC_SUFFIXES = ("ous", "ful", "ive", "able", "ible", "less")
-
-NATIONALITY = set("""german british french american english russian chinese japanese indian european african
-asian italian spanish greek roman dutch swiss swedish australian canadian""".split())
-
-IRREGULAR_VERBS = set("""wrote written brought built made held led ran began begun took taken gave given saw seen found
-knew known became came went gone got said told thought kept left meant met paid sent set spent stood understood
-won drew drawn grew grown chose chosen broke broken rose risen fell fallen flew sang spoke swam sat lay""".split())
-
-# Clearly verbal base forms (noun/verb-ambiguous words such as "design" or "process" are deliberately absent).
-VERB_BASE = set("""according remain stretch describe introduce replace demonstrate observe appear bring allow learn share propose
-rely define regard manipulate intend write break enable involve represent consist depend determine perform operate
-store weigh double become believe exist occur grow increase decrease reduce improve develop discover invent
-complete publish establish announce expand extend connect combine separate divide measure compare explain
-suggest prove solve compute calculate transmit receive deliver achieve reach rely emerge evolve spread arrive
-declare adopt reject accept apply attach attract avoid belong carry choose claim collect compose conduct
-consider continue contribute control cover decide deliver depict destroy detect direct display distribute
-enter equal examine expect experience explore express fail fill follow generate identify imagine indicate
-influence inform inspire install interpret investigate join launch maintain manage mention name notice obtain
-offer open organize participate pass pay place predict prefer prepare present prevent protect publish pull
-push raise realize recognize record refer reflect relate release rely remove repeat replace report require
-research respond restore retain return reveal rule save select send serve settle simulate specify support
-supply surround survive test transfer transform translate treat trigger understand unite update utilize
-visit wait watch win""".split())
-
-
-def verbish(w: str) -> bool:
-    w = w.lower()
-    if w in IRREGULAR_VERBS or w in VERBISH:
-        return True
-    forms = set()
-    if w.endswith("ies"):
-        forms.add(w[:-3] + "y")
-    if w.endswith("es"):
-        forms.add(w[:-2])
-    if w.endswith("s"):
-        forms.add(w[:-1])
-    if w.endswith("ed"):
-        forms |= {w[:-2], w[:-1], w[:-3] + "y" if w.endswith("ied") else w[:-2]}
-        if len(w) > 4 and w[-3] == w[-4]:
-            forms.add(w[:-3])
-    return bool(forms & VERB_BASE) or w in VERB_BASE
-
-
-ORG_WORDS = {"university", "institute", "company", "corporation", "inc", "ltd", "association", "bank",
-             "ministry", "party", "council", "society", "agency", "committee", "department", "school",
-             "college", "laboratory", "lab", "foundation", "organization", "organisation", "union",
-             "army", "navy", "museum", "academy", "club", "group", "press", "prize", "award", "act",
-             "treaty", "war", "empire", "dynasty", "project", "program", "programme", "system"}
-PLACE_WORDS = {"river", "mountain", "mountains", "city", "island", "islands", "sea", "ocean", "republic",
-               "kingdom", "valley", "lake", "desert", "bay", "gulf", "coast", "province", "state", "county",
-               "africa", "asia", "europe", "america", "antarctica", "australia", "india", "china", "japan",
-               "france", "germany", "england", "britain", "russia", "canada", "brazil", "mexico", "italy",
-               "spain", "egypt", "paris", "london", "berlin", "tokyo", "rome", "york", "delhi", "bengaluru",
-               "beijing", "moscow", "united", "states", "earth", "pacific", "atlantic"}
-
-AUX = r"is|are|was|were|has|have|had|can|could|will|would|should|may|might"
-WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*|\d+(?:[.,]\d+)*%?")
+GENERIC_ADJ = set("first second third last next many several various single other another such same certain own few much "
+                  "more most some".split())
+CLAIM_NOUNS = set("""observation idea principle rule law theory claim concept model hypothesis finding proposal conjecture
+effect phenomenon method technique approach argument assumption notion""".split())
+CLAIM_VERBS = set("observe propose state claim suggest note discover argue find formulate hypothesise hypothesize "
+                  "predict show conclude".split())
+DISCOURSE_PRON = {"it", "they", "them", "he", "she", "him", "her", "this", "these", "those", "its", "their", "his"}
+HUMAN_NOUNS = set("""engineers scientists researchers mathematicians physicists chemists biologists doctors teachers students
+people workers soldiers farmers artists writers poets philosophers historians scholars officials leaders kings queens
+emperors founders inventors programmers developers designers architects explorers settlers team teams colleagues
+astronomers economists scientist engineer researcher mathematician physicist chemist biologist doctor teacher
+physicians priests monks merchants citizens women men children crowd mob army forces troops government
+rebels protesters parisians""".split())
+DISC = {"this", "these", "those", "such", "former", "latter", "aforementioned"}
 BLANK = "_____"
-
 ABBR = ["Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "vs", "etc", "e.g", "i.e", "Fig", "No",
         "Inc", "Ltd", "Co", "U.S", "U.K"]
+WEIGHT = {"WHO_AGENT": 1.0, "NAMING": 1.0, "DEFINITION": 1.0, "WHO_SUBJ": 0.95, "WHEN": 0.95, "WHAT_AGENT": 0.95,
+          "QUANT": 0.9, "WHERE": 0.85, "TF": 0.7, "HOW": 0.75, "WHAT_SUBJ": 0.6, "CLOZE": 0.4}
 
 
 # --------------------------------------------------------------------------- #
 # Data structures
 # --------------------------------------------------------------------------- #
 @dataclass
-class Candidate:
-    text: str
-    start: int
-    end: int
-    kind: str          # YEAR | NUMBER | PROPER | TERM
-    score: float = 0.0
-
-
-@dataclass
-class Sentence:
-    idx: int
-    text: str
-    cands: list = field(default_factory=list)
-    score: float = 0.0
-
-
-@dataclass
 class Question:
     qtype: str                       # mcq | tf | wh | cloze
     question: str
     answer: str
-    options: Optional[list] = None   # mcq only
+    options: Optional[list] = None
     answer_letter: Optional[str] = None
+    accept: Optional[list] = None    # alternative acceptable answers (short-answer grading)
+    about: str = ""                  # what the question is about (context)
+    kind: str = ""                   # frame that produced it (WHO_AGENT, WHEN, ...)
     source: str = ""
     sentence_idx: int = -1
+    score: float = field(default=0.0, repr=False)
 
     def to_dict(self):
         d = asdict(self)
-        return {k: v for k, v in d.items() if v not in (None, [])}
+        d.pop("score", None)
+        return {k: v for k, v in d.items() if v not in (None, [], "")}
 
 
 # --------------------------------------------------------------------------- #
@@ -175,7 +104,7 @@ def split_sentences(text: str) -> list:
     t = re.sub(r"\s+", " ", text.strip())
     for a in ABBR:
         t = re.sub(rf"\b{re.escape(a)}\.", lambda m: m.group(0)[:-1].replace(".", "<D>") + "<P>", t)
-    t = re.sub(r"\b([A-Z])\.(?=\s[A-Z])", r"\1<P>", t)          # initials: "J. K. Rowling"
+    t = re.sub(r"\b([A-Z])\.(?=\s[A-Z])", r"\1<P>", t)
     parts = re.split(r'(?<=[.!?])\s+(?=["\'(\[]?[A-Z0-9])', t)
     out = []
     for p in parts:
@@ -186,19 +115,15 @@ def split_sentences(text: str) -> list:
 
 
 def analyze(sentence: str) -> list:
-    """Analyzer for TF-IDF: lower-cased content words (stop-words removed)."""
     return [w.lower() for w in re.findall(r"[A-Za-z]+", sentence) if len(w) > 2 and w.lower() not in STOP]
 
 
-def fit_case(opt: str, at_start: bool) -> str:
-    return opt[:1].upper() + opt[1:] if at_start and opt else opt
+def words(s: str) -> set:
+    return {w for w in re.split(r"[\s'’-]+", s.lower()) if len(w) > 2}
 
 
-def norm_surface(text: str, kind: str) -> str:
-    """Normalise surface form so sentence-initial capitals don't leak the answer."""
-    if kind == "TERM" and text[:1].isupper() and not text.isupper() and text[1:].islower():
-        return text[:1].lower() + text[1:]
-    return text
+def cap1(s: str) -> str:
+    return s[:1].upper() + s[1:] if s else s
 
 
 # --------------------------------------------------------------------------- #
@@ -207,171 +132,39 @@ def norm_surface(text: str, kind: str) -> str:
 class QuizGenerator:
     def __init__(self, text: str, seed: int = 42):
         self.rng = random.Random(seed)
-        raw = split_sentences(text)
-        if len(raw) < 4:
+        self.texts = split_sentences(text)
+        if len(self.texts) < 4:
             raise ValueError("Need at least 4 sentences of input text to generate a meaningful quiz.")
-        self.sentences = [Sentence(i, s) for i, s in enumerate(raw)]
-        self.fulltext = " ".join(s.text for s in self.sentences).lower()
+        self.A = Analyzer(self.texts)
+        self.sentences = self.A.parsed
+        self.low = [s.lower() for s in self.texts]
         self._build_models()
-        self._extract_all_candidates()
-        self._score_sentences()
-        self._build_pools()
+        self._inventory()
+        self._importance()
 
     # ---------------- statistical models ---------------- #
     def _build_models(self):
         self.vec = TfidfVectorizer(analyzer=analyze)
-        self.X = self.vec.fit_transform([s.text for s in self.sentences])
-        self.vocab = self.vec.vocabulary_
+        self.X = self.vec.fit_transform(self.texts)
         w = np.asarray(self.X.sum(axis=0)).ravel()
         w = w / w.max() if w.max() > 0 else w
-        self.weight = {t: float(w[j]) for t, j in self.vocab.items()}
-        # LSA embeddings for distractor similarity
+        self.weight = {t: float(w[j]) for t, j in self.vec.vocabulary_.items()}
         n, v = self.X.shape
         k = min(20, n - 1, v - 1)
-        if k >= 2:
-            E = TruncatedSVD(n_components=k, random_state=0).fit_transform(self.X)
-        else:
-            E = self.X.toarray()
-        norms = np.linalg.norm(E, axis=1, keepdims=True)
-        self.E = E / np.where(norms == 0, 1, norms)
-        # words seen capitalised in non-initial position => genuine proper nouns
-        self.doc_caps = set()
-        for s in self.sentences:
-            for k2, m in enumerate(WORD.finditer(s.text)):
-                w0 = m.group()
-                if k2 > 0 and w0[0].isupper() and w0.lower() not in STOP:
-                    self.doc_caps.add(w0.lower())
+        E = TruncatedSVD(n_components=k, random_state=0).fit_transform(self.X) if k >= 2 else self.X.toarray()
+        nr = np.linalg.norm(E, axis=1, keepdims=True)
+        self.E = E / np.where(nr == 0, 1, nr)
 
     def _tok_weight(self, phrase: str) -> float:
-        parts = [p.lower() for p in re.split(r"[\s-]+", phrase) if p.isalpha() and len(p) > 2 and p.lower() not in STOP]
-        vals = [self.weight.get(p, 0.0) for p in parts]
+        vals = [self.weight.get(p, 0.0) for p in analyze(phrase)]
         return float(np.mean(vals)) if vals else 0.0
 
-    # ---------------- candidate extraction (heuristic NER/chunking) ---------------- #
-    def _extract(self, s: Sentence) -> list:
-        text = s.text
-        toks = list(WORD.finditer(text))
-        n = len(toks)
-        cands, covered = [], []
+    def _ctx(self, idxs):
+        v = self.E[sorted(idxs)].mean(axis=0)
+        n = np.linalg.norm(v)
+        return v / n if n else v
 
-        def gap_ok(a, b):
-            return text[toks[a].end():toks[b].start()] == " "
-
-        # numbers and years
-        for i, t in enumerate(toks):
-            w = t.group()
-            if not re.match(r"^\d", w):
-                continue
-            if re.fullmatch(r"(1\d{3}|20\d{2})", w):
-                cands.append(Candidate(w, t.start(), t.end(), "YEAR"))
-            else:
-                end = t.end()
-                if i + 1 < n and gap_ok(i, i + 1) and toks[i + 1].group().lower() in UNITS:
-                    end = toks[i + 1].end()
-                cands.append(Candidate(text[t.start():end], t.start(), end, "NUMBER"))
-            covered.append((t.start(), cands[-1].end))
-
-        # proper-noun phrases
-        def is_cap(j):
-            w = toks[j].group()
-            lw = w.lower()
-            if not w[0].isupper() or lw in STOP or lw in MONTHS_DAYS or not w.isalpha() and "-" not in w:
-                return False
-            if j == 0:
-                return (j + 1 < n and toks[j + 1].group()[0].isupper() and gap_ok(j, j + 1)) or lw in self.doc_caps
-            return True
-
-        i = 0
-        while i < n:
-            if is_cap(i):
-                j = i
-                while True:
-                    k = j + 1
-                    if k < n and gap_ok(j, k) and is_cap(k):
-                        j = k
-                        continue
-                    if (k + 1 < n and toks[k].group().lower() in CONNECT and gap_ok(j, k)
-                            and gap_ok(k, k + 1) and is_cap(k + 1)):
-                        j = k + 1
-                        continue
-                    break
-                a, b = toks[i].start(), toks[j].end()
-                cands.append(Candidate(text[a:b], a, b, "PROPER"))
-                covered.append((a, b))
-                i = j + 1
-            else:
-                i += 1
-
-        # common-noun terms: runs of content words, windows of 1..3 tokens
-        def in_cov(t):
-            return any(a <= t.start() < b for a, b in covered)
-
-        def ok(t, nxt=None):
-            """Can token t belong to a noun-phrase term? (heuristic POS filter)"""
-            w = t.group()
-            lw = w.lower()
-            if not (w.replace("-", "").isalpha()) or len(w) < 3 or lw in STOP or in_cov(t):
-                return False
-            if lw.endswith("ly") or verbish(lw):
-                return False
-            if lw.endswith("ed") and len(lw) > 4:
-                # participial adjective ("integrated circuits") only if directly followed by a content word
-                return nxt is not None and text[t.end():nxt.start()] == " " and nxt.group().isalpha() \
-                    and nxt.group().lower() not in STOP and not verbish(nxt.group().lower())
-            return True
-
-        runs, run = [], []
-        for i, t in enumerate(toks):
-            nxt = toks[i + 1] if i + 1 < n else None
-            good = ok(t, nxt)
-            if good and (not run or text[run[-1].end():t.start()] == " "):
-                run.append(t)
-            else:
-                if run:
-                    runs.append(run)
-                run = [t] if good else []
-        if run:
-            runs.append(run)
-        for r in runs:
-            # English noun phrases are head-final: a term must be a suffix of the run
-            while r and (r[0].group().lower() in GENERIC or r[0].group().lower().endswith(GENERIC_SUFFIXES)) and len(r) > 1:
-                r = r[1:]
-            if r and r[-1].group().lower().endswith("ed"):
-                continue                                   # run cannot end in a participle
-            if len(r) == 1 and (r[0].group().lower() in GENERIC or r[0].group().lower().endswith(GENERIC_SUFFIXES)):
-                continue
-            for size in (1, 2, 3):
-                if size <= len(r):
-                    seg = r[len(r) - size:]
-                    st, en = seg[0].start(), seg[-1].end()
-                    cands.append(Candidate(norm_surface(text[st:en], "TERM"), st, en, "TERM"))
-        # drop nationality adjectives and other non-entity proper phrases
-        cands = [c for c in cands if not (c.kind == "PROPER" and c.text.lower() in NATIONALITY)]
-        return cands
-
-    def _extract_all_candidates(self):
-        for s in self.sentences:
-            s.cands = self._extract(s)
-        weights = [self._tok_weight(c.text) for s in self.sentences for c in s.cands if c.kind == "TERM"]
-        pos = [w for w in weights if w > 0]
-        base = float(np.median(pos)) if pos else 0.2
-        for s in self.sentences:
-            for c in s.cands:
-                if c.kind == "YEAR":
-                    c.score = base * 1.25
-                elif c.kind == "NUMBER":
-                    c.score = base * 1.05
-                elif c.kind == "PROPER":
-                    c.score = self._tok_weight(c.text) * 1.15 + 0.05
-                else:
-                    nt = len(c.text.split())
-                    freq = len(re.findall(rf"\b{re.escape(c.text.lower())}(?:s|es)?\b", self.fulltext))
-                    recur = 1 + 0.35 * np.log(max(freq, 1)) if freq > 1 else 0.75   # recurring phrases = key terms
-                    c.score = self._tok_weight(c.text) * (1 + 0.3 * (nt - 1)) * recur
-            s.cands = [c for c in s.cands if c.score > 0]
-
-    # ---------------- sentence importance (TextRank + keyword density) ---------------- #
-    def _score_sentences(self, d=0.85, iters=50):
+    def _importance(self, d=0.85, iters=50):
         S = (self.X @ self.X.T).toarray()
         np.fill_diagonal(S, 0)
         rs = S.sum(axis=1, keepdims=True)
@@ -380,269 +173,611 @@ class QuizGenerator:
         for _ in range(iters):
             r = (1 - d) / len(S) + d * P.T @ r
         r = r / r.max()
-        for s in self.sentences:
-            top = sorted((c.score for c in s.cands), reverse=True)[:3]
-            kd = float(np.mean(top)) if top else 0.0
-            pos = 1.0 / (1 + 0.25 * s.idx)
-            s.score = 0.6 * float(r[s.idx]) + 0.3 * kd + 0.1 * pos
+        self.imp = []
+        for i, p in enumerate(self.sentences):
+            pos = 1.0 / (1 + 0.2 * i)
+            has = 1.0 if p.frame else 0.5
+            self.imp.append(0.65 * float(r[i]) + 0.2 * has + 0.15 * pos)
+        m = max(self.imp)
+        self.imp = [x / m for x in self.imp]
 
-    def _usable(self, s: Sentence) -> bool:
-        words = s.text.split()
-        if not (8 <= len(words) <= 35) or "?" in s.text:
-            return False
-        return words[0].lower().strip(",") not in BAD_STARTS
+    # ---------------- entity inventory (for distractors & keyphrases) ---------------- #
+    def _core(self, p, np_):
+        """(char_start, char_end, text) of the NP core: no determiner and no generic leading adjectives."""
+        toks = p.toks[np_.cs:np_.e]
+        while len(toks) > 1 and toks[0].tag == "ADJ" and toks[0].low in GENERIC_ADJ:
+            toks = toks[1:]
+        st, en = toks[0].start, p.toks[np_.e - 1].end
+        txt = p.text[st:en]
+        t0 = toks[0]
+        if t0.i == 0 and t0.tag != "PROPN" and np_.etype in ("CONCEPT", "QUANTITY") and not txt[:2].isupper():
+            txt = txt[0].lower() + txt[1:]
+        return st, en, txt
 
-    # ---------------- distractor pools ---------------- #
-    def _build_pools(self):
-        self.pool = {"TERM": {}, "PROPER": {}, "YEAR": set(), "NUMBER": set()}
-        term_scores = [c.score for s in self.sentences for c in s.cands if c.kind == "TERM"]
-        thr = float(np.percentile(term_scores, 40)) if term_scores else 0.0
-        for s in self.sentences:
-            for c in s.cands:
-                if c.kind == "YEAR":
-                    self.pool["YEAR"].add(int(c.text))
-                elif c.kind in ("TERM", "PROPER"):
-                    if c.kind == "TERM" and c.score < thr:
+    def _inventory(self):
+        self.pool = {"PERSON": {}, "PLACE": {}, "NAMED": {}, "CONCEPT": {}}
+        self.years, self.decades = set(), set()
+        counts = {}
+        for p in self.sentences:
+            for np_ in p.nps:
+                et = np_.etype
+                if et == "PRONOUN":
+                    continue
+                _, _, txt = self._core(p, np_)
+                key = txt.lower()
+                if et == "YEAR":
+                    m = re.match(r"(\d{4})(s?)$", txt)
+                    if m:
+                        (self.decades if m.group(2) else self.years).add(int(m.group(1)))
+                    continue
+                if et == "QUANTITY":
+                    continue
+                if et == "PERSON":
+                    full = self.A.surnames.get(key, txt) if len(txt.split()) == 1 else txt
+                    key, txt = full.lower(), full
+                    bucket = "PERSON"
+                elif et in ("PLACE", "ORG"):
+                    bucket = "PLACE"
+                elif et == "NAMED":
+                    bucket = "NAMED"
+                else:
+                    head = p.toks[np_.head]
+                    if head.tag not in ("NOUN", "ING") or len(txt.split()) > 3 or self._tok_weight(txt) <= 0:
                         continue
-                    e = self.pool[c.kind].setdefault(c.text.lower(), {"surface": c.text, "sents": set()})
-                    e["sents"].add(s.idx)
+                    bucket = "CONCEPT"
+                e = self.pool[bucket].setdefault(key, {"surface": txt, "sents": set()})
+                e["sents"].add(p.idx)
+                counts[(bucket, key)] = counts.get((bucket, key), 0) + 1
+            f = p.frame
+            for fr in p.frames:  # all-caps names after at/in are places/organisations (CERN)
+                for sg in fr.segs:
+                    if sg.kind == "pp" and sg.prep in ("at", "in") and sg.np and sg.np.etype == "NAMED":
+                        _, _, t = self._core(p, sg.np)
+                        if t.isupper() and len(t) > 2:
+                            self.pool["PLACE"].setdefault(t.lower(), {"surface": t, "sents": set()})["sents"].add(p.idx)
+        # keep only informative concepts
+        sc = [self._tok_weight(v["surface"]) for v in self.pool["CONCEPT"].values()]
+        thr = float(np.percentile(sc, 50)) if sc else 0.0
+        self.pool["CONCEPT"] = {k: v for k, v in self.pool["CONCEPT"].items()
+                                if self._tok_weight(v["surface"]) >= thr and not (set(k.split()) & ANAPHORIC)}
+        # key concepts (shown in the UI)
+        scored = []
+        for (b, k), c in counts.items():
+            e = self.pool[b].get(k)
+            if not e:
+                continue
+            w = self._tok_weight(e["surface"]) + 0.05
+            scored.append((c * w * (1.4 if b in ("NAMED", "PERSON") else 1.0), e["surface"], b))
+        scored.sort(reverse=True)
+        seen, self.key_concepts = set(), []
+        for _, sf, b in scored:
+            ws = words(sf)
+            if ws and not (ws & seen):
+                self.key_concepts.append(cap1(sf))
+                seen |= ws
+            if len(self.key_concepts) >= 8:
+                break
 
-    def _vec(self, entry):
-        v = self.E[sorted(entry["sents"])].mean(axis=0)
-        n = np.linalg.norm(v)
-        return v / n if n else v
-
-    def distractors(self, s: Sentence, c: Candidate, k: int = 3) -> Optional[list]:
-        if c.kind == "YEAR":
-            return self._year_distractors(int(c.text), k)
-        if c.kind == "NUMBER":
-            return self._number_distractors(c.text, k)
-        key = c.text.lower()
-        a_tokens = set(re.split(r"[\s-]+", key))
-        sent_low = s.text.lower()
-        ref = self.pool[c.kind].get(key) or {"sents": {s.idx}}
-        av = self._vec(ref)
-        nwords = len(c.text.split())
-        acat = self._pcat(c.text) if c.kind == "PROPER" else None
-        ranked = []
-        for k2, e in self.pool[c.kind].items():
-            if k2 == key or set(re.split(r"[\s-]+", k2)) & a_tokens or k2 in sent_low or key in k2:
+    # ---------------- distractors ---------------- #
+    def _pick(self, bucket: str, answer: str, sidx: int, k: int = 3, extra_pool=None) -> Optional[list]:
+        pool = dict(self.pool[bucket])
+        for b in extra_pool or []:
+            pool.update(self.pool[b])
+        akey = answer.lower()
+        atoks = words(akey)
+        av = self._ctx({sidx})
+        scored = []
+        for key, e in pool.items():
+            if key == akey or key in self.low[sidx] or (words(key) & atoks):
                 continue
-            if acat and self._pcat(e["surface"]) != acat:      # keep entity types consistent
+            wd = abs(len(key.split()) - len(akey.split()))
+            if wd > 1:
                 continue
-            sim = float(self._vec(e) @ av)
-            if sim > 0.97:                      # near-duplicate context => may also be correct
+            sim = float(self._ctx(e["sents"]) @ av)
+            if sim > 0.96:
                 continue
-            diff = abs(len(k2.split()) - nwords)
-            if diff > 1:
+            scored.append((sim - 0.15 * wd + self.rng.random() * 0.01, e["surface"]))
+        scored.sort(reverse=True)
+        out, used = [], {w.rstrip("s") for w in atoks}
+        for _, sf in scored:
+            ws = {w.rstrip("s") for w in words(sf)}
+            if ws & used:
                 continue
-            bonus = 0.05 if (k2.endswith("s") == key.endswith("s")) else 0.0
-            ranked.append((sim + bonus - 0.2 * diff + self.rng.random() * 0.01, e["surface"]))
-        ranked.sort(reverse=True)
-        out, used = [], set(a_tokens)
-        for _, sf in ranked:                    # options must not share words with each other
-            toks_ = set(re.split(r"[\s-]+", sf.lower()))
-            stems = {t.rstrip("s") for t in toks_}
-            if stems & {u.rstrip("s") for u in used}:
-                continue
-            out.append(norm_surface(sf, c.kind))
-            used |= toks_
+            out.append(sf)
+            used |= ws
             if len(out) == k:
-                break
-        return out if len(out) >= k else None
+                return out
+        return None
 
-    def _year_distractors(self, y: int, k: int) -> Optional[list]:
-        near = sorted((v for v in self.pool["YEAR"] if v != y), key=lambda v: abs(v - y))[:k - 1]
-        out = list(near)
-        offsets = [-20, -10, -5, -3, -2, 2, 3, 5, 10, 15, 25]
-        self.rng.shuffle(offsets)
-        for o in offsets:
-            if len(out) >= k:
-                break
-            cand = y + o
-            if cand not in out and cand != y and 0 < cand <= 2100:
-                out.append(cand)
-        return [str(v) for v in out[:k]] if len(out) >= k else None
-
-    def _number_distractors(self, txt: str, k: int) -> Optional[list]:
-        m = re.match(r"^([\d.,]+)(.*)$", txt)
+    def _year_distractors(self, txt: str, k: int = 3) -> Optional[list]:
+        m = re.match(r"(\d{4})(s?)$", txt)
         if not m:
             return None
-        num, suffix = m.group(1), m.group(2)
+        y, dec = int(m.group(1)), m.group(2)
+        near_pool = self.decades if dec else self.years
+        out = sorted((v for v in near_pool if v != y), key=lambda v: abs(v - y))[:k - 1]
+        offs = [-30, -20, -10, 10, 20, 30] if dec else [-20, -10, -5, -3, -2, 2, 3, 5, 10, 15, 25]
+        self.rng.shuffle(offs)
+        for o in offs:
+            if len(out) >= k:
+                break
+            if y + o not in out and 0 < y + o <= 2100:
+                out.append(y + o)
+        return [f"{v}{dec}" for v in out[:k]] if len(out) >= k else None
+
+    def _num_distractors(self, num: str, unit: str = "", k: int = 3) -> Optional[list]:
         try:
             val = float(num.replace(",", ""))
         except ValueError:
             return None
-        has_comma, is_int = "," in num, "." not in num.replace(",", "") or val.is_integer()
-        percent = "percent" in suffix or "%" in suffix or "%" in num
-        factors = [0.5, 0.75, 1.25, 1.5, 2, 3, 0.1, 10]
+        is_int = float(val).is_integer() and "." not in num
+        factors = [0.5, 0.75, 1.5, 2, 3, 0.1, 10, 1.25]
         self.rng.shuffle(factors)
         out = []
         for f in factors:
             v = val * f
-            if percent and v > 100:
-                continue
-            if is_int:
-                v = int(round(v))
-                s = f"{v:,}" if has_comma else str(v)
-            else:
-                s = f"{v:.1f}"
-            full = s + suffix
-            if v > 0 and full != txt and full not in out:
+            s = (f"{int(round(v)):,}" if "," in num else str(int(round(v)))) if is_int else f"{v:.1f}"
+            full = (s + (" " + unit if unit else ""))
+            if v > 0 and s != num and full not in out and not (is_int and int(round(v)) == int(val)):
                 out.append(full)
             if len(out) == k:
                 return out
         return None
 
-    # ---------------- question builders ---------------- #
-    def _blank(self, s: Sentence, c: Candidate) -> str:
-        stem = re.sub(rf"\b{re.escape(c.text)}\b", BLANK, s.text, flags=re.I) if c.text[0].isalnum() else \
-            s.text[:c.start] + BLANK + s.text[c.end:]
-        return stem
+    # ---------------- text helpers ---------------- #
+    def _leaks(self, stem: str, answer: str) -> bool:
+        low = " " + re.sub(r"[^\w\s'-]", " ", stem.lower()) + " "
+        toks = [w for w in re.findall(r"[\w'-]+", answer.lower()) if len(w) > 3 and w not in STOP]
+        if not toks:
+            toks = [answer.lower()]
+        return any(f" {t} " in low or f" {t}s " in low or f" {t}'s " in low for t in toks)
 
-    def _decap(self, phrase: str) -> str:
-        w = phrase.split()
-        if not w:
-            return phrase
-        f = w[0]
-        if f.lower() in STOP:
-            return f[0].lower() + f[1:]
-        if f.isupper() or f.lower() in self.doc_caps or (len(w) > 1 and w[1][:1].isupper()):
-            return phrase
-        return f[0].lower() + phrase[1:]
+    def _clip(self, p, s, e) -> str:
+        return p.span(s, e)
 
-    def _pcat(self, ans: str) -> str:
-        """Coarse entity type for a proper-noun phrase: place / org / person / other."""
-        low = {w.lower() for w in ans.split()}
-        if low & PLACE_WORDS:
-            return "place"
-        if low & ORG_WORDS:
-            return "org"
-        if self._is_person(ans) or (len(low) == 1 and low & self.person_tokens):
-            return "person"
-        return "other"
+    def _lead_tail(self, p, f) -> str:
+        if not f.lead:
+            return ""
+        t0 = p.toks[0]
+        if t0.tag != "PREP":
+            return ""
+        txt = p.span(*f.lead)
+        return txt[0].lower() + txt[1:] if p.toks[1].tag != "PROPN" else txt[0].lower() + txt[1:]
 
-    @property
-    def person_tokens(self) -> set:
-        if not hasattr(self, "_ptoks"):
-            self._ptoks = {w.lower() for s in self.sentences for c in s.cands
-                           if c.kind == "PROPER" and self._is_person(c.text) for w in c.text.split()}
-        return self._ptoks
-
-    def _is_person(self, ans: str) -> bool:
-        ws = ans.split()
-        low = {w.lower() for w in ws}
-        return 2 <= len(ws) <= 3 and all(w[0].isupper() and w.isalpha() for w in ws) \
-            and not (low & ORG_WORDS) and not (low & PLACE_WORDS)
-
-    def _is_place(self, ans: str) -> bool:
-        return bool({w.lower() for w in ans.split()} & PLACE_WORDS)
-
-    def make_cloze(self, s, c):
-        stem = self._blank(s, c)
-        return Question("cloze", f"Fill in the blank: {stem}", norm_surface(c.text, c.kind), source=s.text, sentence_idx=s.idx)
-
-    def make_mcq(self, s, c):
-        d = self.distractors(s, c)
-        if not d:
-            return None
-        at_start = c.start == 0
-        answer = fit_case(norm_surface(c.text, c.kind), at_start)
-        opts = [answer] + [fit_case(x, at_start) for x in d]
-        self.rng.shuffle(opts)
-        letter = "ABCD"[opts.index(answer)]
-        stem = self._blank(s, c)
-        return Question("mcq", f"Choose the option that best completes the sentence: {stem}", answer,
-                        options=opts, answer_letter=letter, source=s.text, sentence_idx=s.idx)
-
-    def make_tf(self, s, c):
-        if self.rng.random() < 0.5:
-            return Question("tf", s.text, "True", source=s.text, sentence_idx=s.idx)
-        d = self.distractors(s, c)
-        if not d:
-            return None
-        rep = fit_case(d[0], c.start == 0)
-        false_stmt = s.text[:c.start] + rep + s.text[c.end:]
-        return Question("tf", false_stmt, "False", source=s.text, sentence_idx=s.idx)
-
-    def make_wh(self, s, c):
-        text = s.text.rstrip(" .!")
-        m = re.match(rf"^(?P<subj>.+?)\s+(?P<aux>{AUX})\s+(?P<rest>.+)$", text)
-        if not m or len(m["subj"].split()) > 8:
-            return None
-        subj, aux, rest, ans = m["subj"], m["aux"], m["rest"], c.text
-        strip_art = lambda x: re.sub(r"^(the|a|an)\s+", "", x.strip(), flags=re.I).lower()
-        q = None
-        if not m:
-            return None
-        if strip_art(subj) == strip_art(ans) and c.kind in ("TERM", "PROPER") and len(rest.split()) >= 3:
-            if c.kind == "PROPER":
-                wh = "Who" if self._is_person(ans) else ("What" if (self._is_place(ans) or
-                     {w.lower() for w in ans.split()} & ORG_WORDS) else None)
-            else:
-                wh = "What"
-            if wh:
-                q = f"{wh} {aux} {rest}?"
-        else:
-            idx = rest.find(ans)
-            if idx < 0:
+    def _others(self, p, f, skip=(), skip_lead=False, skip_kinds=("tail", "coord")) -> Optional[str]:
+        parts = []
+        for sg in f.segs:
+            if sg.kind in skip_kinds or id(sg) in skip:
+                continue
+            if sg.kind == "pp" and sg.np is None:
                 return None
-            before, after = rest[:idx].rstrip(), rest[idx + len(ans):].lstrip()
-            bw = before.split()
-            prep = bw[-1].lower() if bw else ""
-            before_wo = " ".join(bw[:-1]) if prep in {"in", "on", "at", "by", "since", "until", "during", "around"} else before
-            rest_wo = f"{before_wo} {after}".strip()
-            rest_wo = re.sub(r"\s+([,;])", r"\1", rest_wo)
-            if c.kind == "YEAR":
-                if prep in {"in", "on", "during", "around"}:
-                    q = f"When {aux} {self._decap(subj)} {rest_wo}?"
-                elif prep in {"since", "by", "until"}:
-                    q = f"{prep.capitalize()} which year {aux} {self._decap(subj)} {rest_wo}?"
-            elif c.kind == "PROPER":
-                if prep in {"in", "at"} and self._is_place(ans):
-                    q = f"Where {aux} {self._decap(subj)} {rest_wo}?"
-                elif prep == "by" and self._is_person(ans):
-                    q = f"By whom {aux} {self._decap(subj)} {rest_wo}?"
-            elif c.kind == "NUMBER" and subj.lower() == "there" and before == "" and re.fullmatch(r"\d+", ans):
-                q = f"How many {after} {aux} there?"
-        if not q or ans.lower() in q.lower() or len(q.split()) < 4:
+            parts.append(p.span(sg.s, sg.e))
+        if not skip_lead:
+            lt = self._lead_tail(p, f)
+            if lt:
+                parts.append(lt)
+        txt = " ".join(x for x in parts if x).strip()
+        return txt if len(txt.split()) <= 20 else None
+
+    @staticmethod
+    def _aux(f) -> str:
+        return {"past": "did", "3sg": "does"}.get(f.verb.vform, "do")
+
+    def _group(self, p, f):
+        return p.toks[f.vg[0]:f.vg[1]]
+
+    def _simple_active(self, p, f) -> bool:
+        g = self._group(p, f)
+        return (not f.passive and not f.copula and f.verb.tag == "VERB" and f.verb.vform in ("past", "3sg", "base")
+                and all(t.tag == "ADV" or t is f.verb for t in g) and not f.neg and self._subj_ok(f))
+
+    def _simple_passive(self, p, f) -> bool:
+        g = [t for t in self._group(p, f) if t.tag != "ADV"]
+        return f.passive and len(g) == 2 and g[0].tag == "BE" and g[1] is f.verb and not f.neg and self._subj_ok(f)
+
+    @staticmethod
+    def _subj_ok(f) -> bool:
+        return not (f.subj.etype == "PRONOUN" and f.subj.resolved == f.subj.text) and not f.anaphoric
+
+    def _mcq(self, stem, answer, distractors, **kw) -> Optional[Question]:
+        if not distractors or len(distractors) < 3:
             return None
-        return Question("wh", q, norm_surface(ans, c.kind), source=s.text, sentence_idx=s.idx)
+        opts = [answer] + list(distractors[:3])
+        opts = [cap1(o) for o in opts]
+        ans = opts[0]
+        if len({o.lower() for o in opts}) < 4:
+            return None
+        self.rng.shuffle(opts)
+        return Question("mcq", stem, ans, options=opts, answer_letter="ABCD"[opts.index(ans)], **kw)
 
-    # ---------------- orchestration ---------------- #
-    def generate(self, n: int = 10, types=("mcq", "tf", "wh", "cloze")) -> list:
-        builders = {"mcq": self.make_mcq, "tf": self.make_tf, "wh": self.make_wh, "cloze": self.make_cloze}
-        plan = itertools.cycle(["mcq", "wh", "tf", "mcq", "cloze"] if set(types) == set(builders) else list(types))
-        ranked = sorted((s for s in self.sentences if self._usable(s) and s.cands), key=lambda s: -s.score)
-        used_answers, out = set(), []
+    # ---------------- frame -> question candidates ---------------- #
+    def _frame_cands(self, p, f) -> list:
+        out, S = [], p.text
+        if not self._subj_ok(f):
+            return out
+        sm = f.subj.mid or f.subj.text
+        about = cap1(self._core(p, f.subj)[2]) if f.subj.etype != "PRONOUN" else ""
+        if f.subj.resolved != f.subj.text:
+            about = cap1(f.subj.resolved)
+        base = dict(source=S, sentence_idx=p.idx)
 
-        for _ in range(2):                                           # second pass reuses sentences
-            for s in ranked:
-                if len(out) >= n:
-                    break
-                if any(q.sentence_idx == s.idx for q in out) and _ == 0:
-                    continue
-                cands = [c for c in sorted(s.cands, key=lambda c: -c.score)
-                         if c.text.lower() not in used_answers and len(c.text.split()) <= 3
-                         and len(re.findall(rf"\b{re.escape(c.text.lower())}", s.text.lower())) == 1
-                         and not (c.kind == "TERM" and len(c.text) < 4)]
-                want = next(plan)
-                chain = [want] + [t for t in ("mcq", "cloze") if t != want and t in types]
-                made = None
-                for qt in chain:
-                    for c in cands[:6]:
-                        q = builders[qt](s, c)
-                        if q:
-                            made, used = q, c
-                            break
-                    if made:
-                        break
-                if made:
-                    out.append(made)
-                    used_answers.add(used.text.lower())
-            if len(out) >= n:
-                break
+        def add(q, kind, answers_for_leak=None):
+            if not q:
+                return
+            q.kind = kind
+            if not q.about:
+                q.about = about
+            if len(q.question.split()) < 5 or self._leaks(q.question, q.answer):
+                return
+            if set(re.findall(r"[a-z]+", q.question.lower())) & DISC:
+                return
+            q.score = WEIGHT[kind] * (0.55 + 0.45 * self.imp[p.idx])
+            out.append(q)
+
+        sa, sp = self._simple_active(p, f), self._simple_passive(p, f)
+        aux = self._aux(f)
+        lem = f.verb.lemma
+
+        # ---------- WHEN ----------
+        times = []
+        if f.lead_np is not None and f.lead_np.etype == "YEAR" and p.toks[0].low in ("in", "by", "around", "since", "until", "during"):
+            times.append((None, f.lead_np, p.toks[0].low))
+        for sg in f.segs:
+            if sg.kind == "pp" and sg.np and sg.np.etype == "YEAR" and sg.prep in ("in", "by", "around", "since", "until"):
+                times.append((sg, sg.np, sg.prep))
+        if len(times) == 1 and (sa or sp):
+            sg, tnp, prep = times[0]
+            ans = self._core(p, tnp)[2]
+            unit = "decade" if ans.endswith("s") else "year"
+            oth = self._others(p, f, skip={id(sg)} if sg else (), skip_lead=sg is None)
+            if oth is not None:
+                head = f"{cap1(prep)} which {unit}"
+                if sa:
+                    body = f"{aux} {sm} {lem}"
+                else:
+                    be = next(t.low for t in self._group(p, f) if t.tag == "BE")
+                    body = f"{be} {sm} {f.verb.text}"
+                stem = f"{head} {body} {oth}".strip() + "?"
+                add(Question("wh", stem, ans, accept=[ans], **base), "WHEN")
+                add(self._mcq(stem, ans, self._year_distractors(ans), **base), "WHEN")
+
+        # ---------- WHERE ----------
+        places = [sg for sg in f.segs if sg.kind == "pp" and sg.np and sg.prep in ("in", "at")
+                  and (sg.np.etype in ("PLACE", "ORG") or (sg.np.etype == "NAMED" and self._core(p, sg.np)[2].isupper()))]
+        if len(places) == 1 and (sa or sp):
+            sg = places[0]
+            ans = self._core(p, sg.np)[2]
+            oth = self._others(p, f, skip={id(sg)})
+            if oth is not None:
+                if sa:
+                    stem = f"Where {aux} {sm} {lem} {oth}".strip() + "?"
+                else:
+                    be = next(t.low for t in self._group(p, f) if t.tag == "BE")
+                    stem = f"Where {be} {sm} {f.verb.text} {oth}".strip() + "?"
+                acc = [ans, "the " + ans]
+                add(Question("wh", stem, ans, accept=acc, **base), "WHERE")
+                add(self._mcq(stem, ans, self._pick("PLACE", ans, p.idx), **base), "WHERE")
+
+        # ---------- AGENT of a passive ----------
+        by = [sg for sg in f.segs if sg.kind == "pp" and sg.prep == "by" and sg.np]
+        if sp and len(by) == 1:
+            agents = by[0].nps
+            oth = self._others(p, f, skip={id(by[0])})
+            past = past_tense(lem, f.verb.text)
+            if oth is not None and all(a.etype == "PERSON" for a in agents):
+                names = [self._core(p, a)[2] for a in agents]
+                ans = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+                acc = [ans] + names + [n.split()[-1] for n in names]
+                stem = f"Who {past} {sm} {oth}".strip() + "?"
+                add(Question("wh", stem, ans, accept=acc, **base), "WHO_AGENT")
+                if len(names) == 1:
+                    add(self._mcq(stem, ans, self._pick("PERSON", ans, p.idx), **base), "WHO_AGENT")
+            elif oth is not None and len(agents) == 1 and agents[0].etype == "CONCEPT" and not agents[0].plural \
+                    and p.toks[agents[0].s].tag not in ("DET", "POSS") and p.toks[agents[0].head].low not in HUMAN_NOUNS:
+                be = next(t.low for t in self._group(p, f) if t.tag == "BE")
+                ans = self._core(p, agents[0])[2]
+                stem = f"How {be} {sm} {f.verb.text} {oth}".strip() + "?"
+                add(Question("wh", stem, ans, accept=[ans, "by " + ans], **base), "HOW")
+            elif oth is not None and len(agents) == 1 and p.toks[agents[0].head].low in HUMAN_NOUNS:
+                ans = self._core(p, agents[0])[2]
+                stem = f"Who {past} {sm} {oth}".strip() + "?"
+                add(Question("wh", stem, ans, accept=[ans, p.toks[agents[0].head].text], **base), "WHO_AGENT")
+            elif oth is not None and len(agents) == 1 and agents[0].etype in ("CONCEPT", "NAMED", "ORG"):
+                ans = self._core(p, agents[0])[2]
+                bucket = "CONCEPT" if agents[0].etype == "CONCEPT" else "NAMED"
+                wh = "Which organization" if agents[0].etype == "ORG" else "What"
+                stem = f"{wh} {past} {sm} {oth}".strip() + "?"
+                add(Question("wh", stem, ans, accept=[ans], **base), "WHAT_AGENT")
+                add(self._mcq(stem, ans, self._pick(bucket, ans, p.idx), **base), "WHAT_AGENT")
+
+        # ---------- WHO / WHAT as subject ----------
+        rest_s, rest_e = f.vg[0], f.clause_end
+        rest = p.span(rest_s, rest_e)
+        lead_ok = (not f.lead) or p.toks[0].tag == "PREP"
+        if rest and 3 <= len(rest.split()) <= 24 and lead_ok and not f.neg and not f.copula and f.verb.tag == "VERB":
+            lead = p.span(*f.lead) if f.lead else ""
+            def compose(wh):
+                return (f"{lead}, {wh.lower()} {rest}?" if lead else f"{wh} {rest}?")
+            hh = p.toks[f.subj.head]
+            human = hh.low in HUMAN_NOUNS or (hh.text[0].isupper() and hh.low.endswith(("ians", "ites", "ese")))
+            if human and f.subj.etype != "PERSON" and not f.passive and f.subj.resolved == f.subj.text \
+                    and p.toks[f.subj.s].tag != "POSS":
+                ans = self._core(p, f.subj)[2]
+                if f.verb.vform == "base":      # plural subject -> singular "who"
+                    st0 = p.toks[rest_s].start
+                    vt = f.verb
+                    rest = rest[:vt.start - st0] + third_person(vt.lemma) + rest[vt.end - st0:]
+                add(Question("wh", compose("Who"), ans, accept=[ans, hh.text], **base), "WHO_SUBJ")
+            elif f.subj.etype == "PERSON" and not f.passive:
+                ans = f.subj.resolved
+                acc = [ans, ans.split()[-1]]
+                stem = compose("Who")
+                add(Question("wh", stem, ans, accept=acc, **base), "WHO_SUBJ")
+                add(self._mcq(stem, ans, self._pick("PERSON", ans, p.idx), **base), "WHO_SUBJ")
+            elif f.subj.etype in ("CONCEPT", "NAMED", "ORG") and p.toks[f.subj.s].tag != "POSS" \
+                    and len(f.subj.core.split()) <= 5 and f.subj.resolved == f.subj.text:
+                ans = self._core(p, f.subj)[2]
+                bucket = "CONCEPT" if f.subj.etype == "CONCEPT" else "NAMED"
+                stem = compose("What")
+                add(Question("wh", stem, ans, accept=[ans, f.subj.text], **base), "WHAT_SUBJ")
+                add(self._mcq(stem, ans, self._pick(bucket, ans, p.idx), **base), "WHAT_SUBJ")
+
+        # ---------- QUANTITY ----------
+        if sa:
+            for sg in f.segs:
+                if sg.kind == "obj" and sg.np and sg.np.etype == "QUANTITY":
+                    toks = p.toks[sg.np.cs:sg.np.e]
+                    if not toks or toks[0].tag != "NUM" or not re.match(r"\d", toks[0].text) or len(toks) < 2:
+                        continue
+                    num, tail = toks[0].text, toks[1:]
+                    unit = tail[-1].low if tail[-1].low in UNITS else None
+                    oth = self._others(p, f, skip={id(sg)})
+                    if oth is None:
+                        continue
+                    if unit and len(tail) == 1:
+                        if lem not in MEASURE_VERBS:
+                            continue
+                        stem = f"{MEASURE_VERBS[lem]} {aux} {sm} {lem} {oth}".strip() + "?"
+                        ans = f"{num} {unit}"
+                        dis = self._num_distractors(num, unit)
+                    else:
+                        noun = p.span(tail[0].i, sg.np.e)
+                        stem = f"How many {noun} {aux} {sm} {lem} {oth}".strip() + "?"
+                        ans = num
+                        dis = self._num_distractors(num)
+                    acc = [ans, num]
+                    add(Question("wh", stem, ans, accept=acc, **base), "QUANT")
+                    add(self._mcq(stem, ans, dis, **base), "QUANT")
+
+        # ---------- DEFINITION ----------
+        objs = [sg for sg in f.segs if sg.kind == "obj"]
+        if f.copula and not f.neg and objs and f.subj.etype in ("CONCEPT", "NAMED") and f.subj.resolved == f.subj.text:
+            first = objs[0]
+            comp = p.span(first.s, f.clause_end)
+            if p.toks[first.s].tag == "DET" and 4 <= len(comp.split()) <= 26 and " one of " not in f" {comp.lower()} " \
+                    and not first.np.core.lower().startswith(("first", "number")):
+                be = next(t.low for t in self._group(p, f) if t.tag == "BE")
+                ans = self._core(p, f.subj)[2]
+                bucket = "CONCEPT" if f.subj.etype == "CONCEPT" else "NAMED"
+                add(Question("wh", f"What {be} {comp}?", ans, accept=[ans, f.subj.text], **base), "DEFINITION")
+                add(self._mcq(f"Which of the following {be} {comp}?", ans, self._pick(bucket, ans, p.idx), **base), "DEFINITION")
+
+        # ---------- NAMING ("an observation known as Moore's Law") ----------
+        if f.naming and f.appos:
+            head = p.toks[f.appos.head].low
+            that = [sg for sg in f.segs if sg.kind == "that"]
+            if head in CLAIM_NOUNS and that and f.verb.lemma in CLAIM_VERBS:
+                clause = p.span(that[0].s + 1, that[0].e)
+                kw = next((t.low for t in p.toks[f.appos.e:] if t.low in ("known", "called", "termed", "named")), "known")
+                tail_word = "called" if kw in ("called", "named", "termed") else "known as"
+                stem = f"What is the {head} that {clause} {tail_word}?"
+                ans = self._core(p, f.naming)[2]
+                acc = [ans, re.sub(r"['’]s\b", "", ans)]
+                add(Question("wh", stem, ans, accept=acc, about=ans, **base), "NAMING")
+                add(self._mcq(stem, ans, self._pick("NAMED", ans, p.idx), about=ans, **base), "NAMING")
         return out
+
+    # ---------------- resolved sentence, true/false, cloze ---------------- #
+    def _reps_for_resolution(self, p, f) -> list:
+        """Character replacements that make the sentence stand alone (pronoun / surname resolution)."""
+        reps = []
+        if f and f.subj.resolved and f.subj.resolved != f.subj.text:
+            st, en = p.toks[f.subj.s].start, p.toks[f.subj.e - 1].end
+            txt = f.subj.resolved if f.subj.s == 0 else (f.subj.mid or f.subj.resolved)
+            reps.append((st, en, txt))
+        return reps
+
+    @staticmethod
+    def _apply(text: str, reps: list) -> str:
+        for st, en, new in sorted(reps, key=lambda r: -r[0]):
+            text = text[:st] + new + text[en:]
+        return text
+
+    def _clean_for_statement(self, p, f) -> bool:
+        if not f or not 7 <= len(p.toks) <= 34 or not self._subj_ok(f):
+            return False
+        # unresolved pronouns elsewhere make the statement ungrounded
+        for t in p.toks[f.subj.e:]:
+            if t.tag in ("PRON",) and t.low in DISCOURSE_PRON:
+                return False
+        if any(t.low in DISC for t in p.toks):
+            return False
+        return p.toks[0].low not in ("however", "thus", "therefore", "moreover", "also", "but")
+
+    def _tf_cands(self, p) -> list:
+        f = p.frame
+        if not self._clean_for_statement(p, f):
+            return []
+        about = cap1(f.subj.resolved) if f.subj.etype != "PRONOUN" or f.subj.resolved != f.subj.text else ""
+        base_reps = self._reps_for_resolution(p, f)
+        true_text = self._apply(p.text, base_reps)
+        w = WEIGHT["TF"] * (0.55 + 0.45 * self.imp[p.idx])
+        out = [Question("tf", true_text, "True", about=about, kind="TF", source=p.text, sentence_idx=p.idx, score=w)]
+        sw = self._swap(p, f, base_reps)
+        if sw:
+            new_text, what = sw
+            out.append(Question("tf", new_text, "False", about=about, kind="TF", source=p.text,
+                                sentence_idx=p.idx, score=w * 1.05))
+        return out
+
+    def _swap(self, p, f, base_reps) -> Optional[tuple]:
+        """Make a plausible FALSE statement by replacing one role-bearing entity with a same-type one."""
+        def reps_with(st, en, new):
+            r = [x for x in base_reps if not (x[0] < en and st < x[1])]
+            r.append((st, en, new))
+            return self._apply(p.text, r)
+
+        s_idx = p.idx
+        nps = [(sg.np, sg.prep) for sg in f.segs if sg.np] + ([(f.lead_np, "")] if f.lead_np else [])
+        # 1. year
+        for np_, prep in nps:
+            if np_.etype == "YEAR":
+                txt = self._core(p, np_)[2]
+                d = self._year_distractors(txt, 3)
+                if d:
+                    st, en, _ = self._core(p, np_)
+                    return reps_with(st, en, d[0]), "year"
+        # 2. person (subject or single agent)
+        pers = [f.subj] if f.subj.etype == "PERSON" else []
+        pers += [sg.np for sg in f.segs if sg.kind == "pp" and sg.prep == "by" and len(sg.nps) == 1 and sg.np.etype == "PERSON"]
+        for np_ in pers:
+            name = f.subj.resolved if np_ is f.subj else self._core(p, np_)[2]
+            d = self._pick("PERSON", name, s_idx, 1)
+            if d:
+                if np_ is f.subj:
+                    st, en = p.toks[np_.s].start, p.toks[np_.e - 1].end
+                else:
+                    st, en, _ = self._core(p, np_)
+                return reps_with(st, en, d[0]), "person"
+        # 3. place
+        for np_, prep in nps:
+            if prep in ("in", "at") and (np_.etype in ("PLACE", "ORG")):
+                txt = self._core(p, np_)[2]
+                d = self._pick("PLACE", txt, s_idx, 1)
+                if d:
+                    st, en, _ = self._core(p, np_)
+                    return reps_with(st, en, d[0]), "place"
+        # 4. quantity
+        for np_, prep in nps:
+            if np_.etype == "QUANTITY":
+                toks = p.toks[np_.cs:np_.e]
+                if toks and re.match(r"\d", toks[0].text):
+                    d = self._num_distractors(toks[0].text)
+                    if d:
+                        return reps_with(toks[0].start, toks[0].end, d[0]), "quantity"
+        # 5. named entity / concept object
+        for np_, prep in nps:
+            if np_.etype in ("NAMED", "CONCEPT") and np_.head >= 0:
+                st, en, txt = self._core(p, np_)
+                bucket = "NAMED" if np_.etype == "NAMED" else "CONCEPT"
+                d = self._pick(bucket, txt, s_idx, 3)
+                if not d:
+                    continue
+                det = p.toks[np_.s].low if p.toks[np_.s].tag == "DET" else ""
+                if det in ("each", "every", "all", "some", "many", "no", "any", "both") or " of " in f" {txt.lower()} ":
+                    continue
+                for cand in d:
+                    plural_c, plural_a = cand.lower().endswith("s"), np_.plural
+                    if det in ("a", "an") and plural_c:
+                        continue
+                    if det in ("a", "an") and (cand[0].lower() in "aeiou") != (det == "an"):
+                        continue
+                    if bucket == "CONCEPT" and plural_c != plural_a:
+                        continue
+                    return reps_with(st, en, cand), "term"
+        return None
+
+    def _cloze_cands(self, p) -> list:
+        f = p.frame
+        if p.toks[0].low in ("however", "thus", "therefore", "moreover") and not f:
+            return []
+        if not (7 <= len(p.toks) <= 34):
+            return []
+        if f and not self._clean_for_statement(p, f):
+            return []
+        if not f and any(t.tag == "PRON" and t.low in DISCOURSE_PRON for t in p.toks):
+            return []
+        reps = self._reps_for_resolution(p, f)
+        out = []
+        for np_ in p.nps:
+            if np_.etype in ("PRONOUN",):
+                continue
+            st, en, txt = self._core(p, np_)
+            if any(r[0] < en and st < r[1] for r in reps):
+                continue
+            if len(txt.split()) > 3:
+                continue
+            if p.text.lower().count(txt.lower()) != 1:
+                continue
+            et = np_.etype
+            head = p.toks[np_.head]
+            if et == "CONCEPT" and (head.tag != "NOUN" or self._tok_weight(txt) < 0.4 or len(txt) < 5):
+                continue
+            boost = {"PERSON": 1.2, "NAMED": 1.2, "YEAR": 1.1, "QUANTITY": 1.0, "PLACE": 1.1, "ORG": 1.1, "CONCEPT": 1.0}[et]
+            wt = 0.5 + (self._tok_weight(txt) if et == "CONCEPT" else 0.5)
+            stem_text = self._apply(p.text, reps + [(st, en, BLANK)]) if not reps else None
+            if stem_text is None:
+                # blank in the resolved text: shift by the length change of earlier replacements
+                shift = sum(len(r[2]) - (r[1] - r[0]) for r in reps if r[1] <= st)
+                new = self._apply(p.text, reps)
+                stem_text = new[:st + shift] + BLANK + new[en + shift:]
+            ans = f.subj.resolved if (f and et == "PERSON" and np_ is f.subj) else txt
+            q = Question("cloze", "Fill in the blank: " + stem_text, ans, accept=[ans], source=p.text, sentence_idx=p.idx,
+                         about=cap1(f.subj.resolved) if f and f.subj.etype != "PRONOUN" else "", kind="CLOZE")
+            q.score = WEIGHT["CLOZE"] * (0.55 + 0.45 * self.imp[p.idx]) * boost * wt
+            out.append(q)
+        out.sort(key=lambda q: -q.score)
+        return out[:3]
+
+    # ---------------- selection ---------------- #
+    def generate(self, n: int = 10, types=("mcq", "tf", "wh", "cloze")) -> list:
+        cands = []
+        for p in self.sentences:
+            for f in p.frames:
+                cands += self._frame_cands(p, f)
+            cands += self._tf_cands(p)
+            cands += self._cloze_cands(p)
+        cands = [q for q in cands if q.qtype in types]
+        # drop duplicates
+        seen, uniq = set(), []
+        for q in sorted(cands, key=lambda q: -q.score):
+            k = (q.question.lower(), q.qtype)
+            if k not in seen:
+                seen.add(k)
+                uniq.append(q)
+        cands = uniq
+        order = ["mcq", "wh", "tf", "mcq", "wh", "tf", "mcq", "cloze"] if set(types) >= {"mcq", "tf", "wh", "cloze"} else list(types)
+        chosen, used_ans, per_sent, per_kind = [], set(), {}, {}
+
+        def usable(q, strict):
+            a = q.answer.lower()
+            if a in used_ans:
+                return False
+            if per_sent.get(q.sentence_idx, 0) >= (1 if strict else 2):
+                return False
+            return True
+
+        for rnd in range(2):
+            ti = 0
+            while len(chosen) < n:
+                want = order[ti % len(order)]
+                ti += 1
+                pool = [q for q in cands if q not in chosen and usable(q, rnd == 0) and q.qtype == want]
+                if not pool:
+                    pool = [q for q in cands if q not in chosen and usable(q, rnd == 0)]
+                if not pool:
+                    break
+                best = max(pool, key=lambda q: q.score - 0.12 * per_kind.get(q.kind, 0))
+                chosen.append(best)
+                used_ans.add(best.answer.lower())
+                per_sent[best.sentence_idx] = per_sent.get(best.sentence_idx, 0) + 1
+                per_kind[best.kind] = per_kind.get(best.kind, 0) + 1
+                if ti > 4 * n + 12:
+                    break
+            if len(chosen) >= n:
+                break
+        chosen.sort(key=lambda q: q.sentence_idx)
+        return chosen
 
 
 # --------------------------------------------------------------------------- #
@@ -677,8 +812,8 @@ def run_interactive(qs: list) -> None:
             ok = input("True or False (t/f): ").strip().lower()[:1] == q.answer[0].lower()
         else:
             g = re.sub(r"^(the|a|an)\s+", "", input("Your answer: ").strip().lower())
-            a = re.sub(r"^(the|a|an)\s+", "", q.answer.lower())
-            ok = difflib.SequenceMatcher(None, g, a).ratio() >= 0.85
+            ok = any(difflib.SequenceMatcher(None, g, re.sub(r"^(the|a|an)\s+", "", a.lower())).ratio() >= 0.85
+                     for a in (q.accept or [q.answer]))
         score += ok
         print("Correct!" if ok else f"Not quite. Answer: {q.answer}")
     print(f"\nScore: {score}/{len(qs)}")
@@ -697,7 +832,8 @@ def main(argv=None):
 
     text = open(a.input, encoding="utf-8").read() if a.input else sys.stdin.read()
     types = tuple(t.strip() for t in a.types.split(",") if t.strip())
-    qs = QuizGenerator(text, seed=a.seed).generate(a.num, types)
+    gen = QuizGenerator(text, seed=a.seed)
+    qs = gen.generate(a.num, types)
     if a.interactive:
         return run_interactive(qs)
     out = json.dumps([q.to_dict() for q in qs], indent=2, ensure_ascii=False) if a.format == "json" else to_markdown(qs)
