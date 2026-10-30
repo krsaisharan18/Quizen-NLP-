@@ -2,8 +2,6 @@
 
 Generate multiple-choice, true/false, short-answer and fill-in-the-blank quizzes from any passage of text, using **classical Natural Language Processing only**. There is no LLM, neural network, pretrained model or external API; everything runs locally.
 
-![Quiz screen](ui.png)
-
 ---
 
 ## Table of contents
